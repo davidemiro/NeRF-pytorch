@@ -1,10 +1,13 @@
+import nerf.model
 from utils.load_data import load_blender_data
 from utils.configs_parser import configs_parser
+from utils.rays_utils import *
 from nerf.create_nerf import init_nerf
 from nerf.rendering import render
 import utils.rays_utils as rays_utils
 import numpy as np
 import torch
+import time
 
 
 
@@ -14,9 +17,11 @@ def train():
     parser = configs_parser()
     args = parser.parse_args()
 
-    #load lego data
+    #load lego data (blender data)
     images, poses, render_poses, hwf, index_split = load_blender_data("data/nerf_synthetic/lego")
     index_train, index_val, index_test = index_split
+
+    H, W, focal = hwf
 
     near = 2.
     far = 6.
@@ -26,40 +31,57 @@ def train():
     else:
         images = images[..., :3]
 
-    #Define Width W Height H and Focal length focal
-    H, W, focal = hwf
-    H, W = int(H), int(W)
-    hwf = [H, W, focal]
 
-    num_iterations = 100000
-    for i in range(num_iterations):
+    model = nerf.model.MLP()
 
-        # Random from one image
-        index = np.random.choice(index_train)
-        target = images[index]
-        pose = poses[index, :3, :4]
+    model_fine = nerf.model.MLP()
 
-        #get the info of each ray in the image
-        rays_origin, rays_direction = rays_utils.get_rays(H, W, focal, pose)
+    encodings_points = nerf.encoding.PositionalEncoder(args.L ,log_sampling=True, include_input=True, embed=True)
 
-        coords = torch.stack(torch.meshgrid(
-                torch.arange(0,H), torch.arange(0,W), indexing='ij'), -1)
-        coords = torch.reshape(coords, [-1, 2]) # (H * W, 2)
-        select_inds = np.random.choice(
-            coords.shape[0], size=[args.num_rand], replace=False) # (num_rand,)
-
-        select_coords = coords[select_inds].long()  # (N_rand, 2)
-        rays_origin = rays_origin[select_coords[:,0],select_coords[:,1]] # (num_rand, 3)
-        rays_direction = rays_direction[select_coords[:,0],select_coords[:,1]] # (num_rand,3)
-        batch_rays = torch.stack([rays_origin, rays_direction], 0)
-        target_s = target[select_coords[:, 0], select_coords[:, 1]]
-
-
-        models = init_nerf()
-        rgb, disp, acc, extras = render(H, W, focal, models, args.num_coarse_samples, args.num_fine_samples, chunk=args.num_chunk, rays=batch_rays)
+    encodings_view = nerf.encoding.PositionalEncoder(args.L_view, log_sampling=True, include_input=True, embed=True)
 
 
 
-train()
+    # Create optimizer
+    learning_rate = args.learning_rate
+    if args.learning_rate_decay > 0:
+        learning_rate = torch.ExponentialDecay(args.learning_rate,decay_steps=args.learning_rate_decay * 1000, decay_rate=0.1)
+    optimizer = torch.optimizers.Adam(learning_rate)
+
+    if args.batching:
+        rays = [get_rays(H, W, focal, p) for p in poses[:, :3, :4]]
+        rays = np.stack(rays, axis=0)  # [N, ray origins + ray directions, H, W, 3]
+        rays_rgb = np.concatenate([rays, images[:, None, ...]], 1) # [N, H, W, ray origins + ray directions + rgb, 3]
+        rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
+        rays_rgb = np.stack([rays_rgb[i] for i in index_train], axis=0)  # train images only # [(N-1)*H*W, ro+rd+rgb, 3]
+        rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
+        rays_rgb = rays_rgb.astype(np.float32)
+        print('shuffle rays')
+        np.random.shuffle(rays_rgb)
+        print('done')
+        index_batch = 0
+
+
+    for i in range(args.start, args.num_iterations):
+        time0 = time.time()
+
+        if args.batching:
+            # Random over all images
+            batch = rays_rgb[index_batch:index_batch+args.num_rand_rays]  # [B, 2+1, 3*?]
+            batch = torch.transpose(batch, [1, 0, 2])
+
+            # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
+            # target_s[n, rgb] = example_id, observed color.
+            batch_rays, target_s = batch[:2], batch[2]
+
+            index_batch += args.num_rand_rays
+            if index_batch >= rays_rgb.shape[0]:
+                np.random.shuffle(rays_rgb)
+                index_batch = 0
+
+
+
+
+
 
 
